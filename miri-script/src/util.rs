@@ -1,5 +1,5 @@
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use dunce::canonicalize;
@@ -145,4 +145,47 @@ impl MiriEnv {
         .run()?;
         Ok(())
     }
+}
+
+/// Receives an iterator of files.
+/// Will format each file with the miri rustfmt config.
+/// Does not follow module relationships.
+pub fn format_files(
+    shell: &Shell,
+    files: impl Iterator<Item = Result<PathBuf, walkdir::Error>>,
+    toolchain: &str,
+    config_path: &Path,
+    flags: &[OsString],
+) -> anyhow::Result<()> {
+    use itertools::Itertools;
+
+    let mut first = true;
+
+    // Format in batches as not all out files fit into Windows' command argument limit.
+    for batch in &files.chunks(128) {
+        // Build base command.
+        let mut cmd = cmd!(
+            shell,
+            "rustfmt +{toolchain} --edition=2021 --config-path {config_path} --unstable-features --skip-children {flags...}"
+        );
+        if first {
+            eprintln!("$ {cmd} ...");
+            first = false;
+        }
+        // Add files.
+        for file in batch {
+            // Make it a relative path so that on platforms with extremely tight argument
+            // limits (like Windows), we become immune to someone cloning the repo
+            // 50 directories deep.
+            let file = file?;
+            let file = file.strip_prefix(shell.current_dir())?;
+            cmd = cmd.arg(file);
+        }
+
+        // Run commands.
+        // We want our own error message, repeating the command is too much.
+        cmd.quiet().run().map_err(|_| anyhow::anyhow!("`rustfmt` failed"))?;
+    }
+
+    Ok(())
 }
