@@ -2,6 +2,8 @@ use std::env;
 use std::ffi::OsString;
 use std::io::Write;
 use std::ops::Not;
+use std::path::Path;
+use std::path::PathBuf;
 use std::process;
 use std::thread;
 use std::time;
@@ -529,17 +531,40 @@ impl Command {
         let e = MiriEnv::new()?;
         let toolchain = &e.toolchain;
         let config_path = path!(e.miri_dir / "rustfmt.toml");
+        let flags = &flags[..];
 
+        // Format individual crates
+        let crates = [
+            e.miri_dir.clone(),
+            path!(e.miri_dir / "cargo-miri"),
+            path!(e.miri_dir / "miri-script"),
+            path!(e.miri_dir / "test_dependencies"),
+        ];
+        format_crates(&e.sh, crates.into_iter(), &toolchain, &config_path, flags)
+            .context("`cargo fmt` failed")?;
+
+        // Format benchmarks
+        let bnch_cg_miri_path = path!(e.miri_dir / "bench-cargo-miri");
+        let benches = std::fs::read_dir(bnch_cg_miri_path)?.map(|entry| entry.unwrap().path());
+        format_crates(&e.sh, benches, &toolchain, &config_path, flags)
+            .context("`cargo fmt` failed")?;
+
+        // Format test-cargo-miri
+        let tst_cg_miri_path = path!(e.miri_dir / "test-cargo-miri");
+        let tests = std::fs::read_dir(tst_cg_miri_path)?
+            .map(|entry| entry.unwrap().path())
+            .filter(|pth| pth.is_dir());
+        format_crates(&e.sh, tests, &toolchain, &config_path, flags)
+            .context("`cargo fmt` failed")?;
+
+        // Run rustfmt on each individual test file.
         let mut cmd = cmd!(
             e.sh,
             "rustfmt +{toolchain} --edition=2021 --config-path {config_path} --unstable-features --skip-children {flags...}"
         );
         eprintln!("$ {cmd} ...");
-
-        // Add all the filenames to the command.
-        // FIXME: `rustfmt` will follow the `mod` statements in these files, so we get a bunch of
-        // duplicate diffs.
-        for item in WalkDir::new(&e.miri_dir).into_iter().filter_entry(|entry| {
+        
+        for item in WalkDir::new(&e.miri_dir.join("tests")).into_iter().filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
             let ty = entry.file_type();
             if ty.is_file() {
@@ -551,12 +576,41 @@ impl Command {
         }) {
             let item = item?;
             if item.file_type().is_file() {
-                cmd = cmd.arg(item.into_path());
+                let stripped = item.into_path().strip_prefix(e.miri_dir.join("tests"))?.to_owned();
+                cmd = cmd.arg(stripped);
             }
         }
+
+        let _guard = e.sh.push_dir(e.miri_dir.join("tests"));
+
+        debug_assert!(
+            cmd.to_string().len() <= 2usize.pow(15),
+            "Too many rustfmt arguments! Will not run on Windows."
+        );
 
         // We want our own error message, repeating the command is too much.
         cmd.quiet().run().map_err(|_| anyhow!("`rustfmt` failed"))?;
         Ok(())
     }
+}
+
+fn format_crates<'a>(
+    shell: &Shell,
+    crates: impl Iterator<Item = PathBuf>,
+    toolchain: &str,
+    config_path: &Path,
+    flags: &[OsString],
+) -> xshell::Result<()> {
+    // We don't want to --ignore-children here or else it will only format
+    // main.rs or lib.rs for the crates.
+    let cargo_fmt =
+        cmd!(shell, "cargo +{toolchain} fmt --all -- --config-path {config_path} {flags...}")
+            .quiet();
+
+    for path in crates {
+        let _crate_shell = shell.push_dir(path);
+        cargo_fmt.run()?;
+    }
+
+    Ok(())
 }
