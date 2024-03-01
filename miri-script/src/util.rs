@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use dunce::canonicalize;
 use path_macro::path;
-use xshell::{cmd, Shell};
+use xshell::{cmd, Cmd, Shell};
 
 pub fn miri_dir() -> std::io::Result<PathBuf> {
     const MIRI_SCRIPT_ROOT_DIR: &str = env!("CARGO_MANIFEST_DIR");
@@ -147,6 +147,18 @@ impl MiriEnv {
     }
 }
 
+fn get_rustfmt_env<'a>(
+    shell: &'a Shell,
+    toolchain: &'a str,
+    config_path: &'a Path,
+    flags: &'a [OsString],
+) -> Cmd<'a> {
+    cmd!(
+        shell,
+        "rustfmt +{toolchain} --edition=2021 --config-path {config_path} --unstable-features --skip-children {flags...}"
+    )
+}
+
 /// Receives an iterator of files.
 /// Will format each file with the miri rustfmt config.
 /// Does not follow module relationships.
@@ -157,35 +169,34 @@ pub fn format_files(
     config_path: &Path,
     flags: &[OsString],
 ) -> anyhow::Result<()> {
-    use itertools::Itertools;
+    use rayon::prelude::*;
 
-    let mut first = true;
+    eprintln!("$ {} ...", get_rustfmt_env(shell, toolchain, config_path, flags));
 
-    // Format in batches as not all out files fit into Windows' command argument limit.
-    for batch in &files.chunks(128) {
-        // Build base command.
-        let mut cmd = cmd!(
-            shell,
-            "rustfmt +{toolchain} --edition=2021 --config-path {config_path} --unstable-features --skip-children {flags...}"
-        );
-        if first {
-            eprintln!("$ {cmd} ...");
-            first = false;
-        }
-        // Add files.
-        for file in batch {
-            // Make it a relative path so that on platforms with extremely tight argument
-            // limits (like Windows), we become immune to someone cloning the repo
-            // 50 directories deep.
-            let file = file?;
-            let file = file.strip_prefix(shell.current_dir())?;
-            cmd = cmd.arg(file);
-        }
+    let files = files.collect::<Result<Vec<PathBuf>, _>>()?;
 
-        // Run commands.
-        // We want our own error message, repeating the command is too much.
-        cmd.quiet().run().map_err(|_| anyhow::anyhow!("`rustfmt` failed"))?;
-    }
+    files
+        .par_chunks(64)
+        .map(|files| -> anyhow::Result<()> {
+            let shell = MiriEnv::new()?;
+            let mut cmd = get_rustfmt_env(&shell.sh, toolchain, config_path, flags);
+
+            cmd = cmd.ignore_stderr();
+            cmd = cmd.ignore_stdout();
+
+            for file in files {
+                // Make it a relative path so that on platforms with extremely tight argument
+                // limits (like Windows), we become immune to someone cloning the repo
+                // 50 directories deep.
+                let file = file.strip_prefix(&shell.miri_dir)?;
+                cmd = cmd.arg(file);
+            }
+
+            cmd.quiet().run()?;
+
+            Ok(())
+        })
+        .collect::<Result<Box<[()]>, _>>()?;
 
     Ok(())
 }
